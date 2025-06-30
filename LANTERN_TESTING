@@ -1,0 +1,876 @@
+#include <WiFi.h>
+#include <AsyncUDP.h>
+#include <Adafruit_NeoPixel.h>
+
+#define LED_PIN 36
+#define NUM_PIXELS 7
+#define BUTTON_PIN 0
+
+Adafruit_NeoPixel lantern(NUM_PIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// WiFi Configuration - Change these to match your network
+const char* ssid = "ShowDuino-AP";        // Your WiFi network name
+const char* password = "showcontrol123";   // Your WiFi password
+
+// Set to false to disable WiFi entirely (pure standalone mode)
+bool enableWiFi = true;
+
+AsyncUDP udp;
+typedef void (*EffectFunction)();
+
+bool wifiConnected = false;
+
+#define BUTTON_PIN 0
+bool lampLit = false;
+bool breakerActive = false;
+
+bool armed = false;
+int pressCount = 0;
+unsigned long lastPressTime = 0;
+const unsigned long pressTimeout = 5000;
+
+bool lastButtonState = HIGH;
+bool currentButtonState = HIGH;  // Current stable button state
+bool lastStableState = HIGH;    // Last confirmed stable state
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 250;
+
+const unsigned long longPressDuration = 3000;
+
+
+bool buttonPressed = false;
+unsigned long buttonPressTime = 0;
+unsigned long lastButtonCheck = 0;
+
+int currentEffectIndex = -1;
+
+// Timing variables for non-blocking operations
+unsigned long lastEffectUpdate = 0;
+unsigned long effectUpdateInterval = 100;
+
+// ===============================================================================
+// ALL YOUR ORIGINAL EFFECTS - CONVERTED TO NON-BLOCKING
+// ===============================================================================
+
+void updateFlickerEffect() {
+  for (int i = 0; i < NUM_PIXELS; i++) {
+    int flicker = random(100, 255);
+    lantern.setPixelColor(i, lantern.Color(flicker, random(30, 80), 0));
+  }
+  lantern.show();
+}
+
+void updateGlowEffect(uint8_t red, uint8_t green, uint8_t blue) {
+  static float brightness = 30;
+  static float direction = 3;
+
+  brightness += direction;
+  if (brightness >= 255 || brightness <= 30) direction *= -1;
+
+  for (int i = 0; i < NUM_PIXELS; i++) {
+    lantern.setPixelColor(i, lantern.Color(
+      (red * brightness) / 255,
+      (green * brightness) / 255,
+      (blue * brightness) / 255
+    ));
+  }
+  lantern.show();
+}
+
+void updateBlackoutEffect() {
+  lantern.clear();
+  lantern.show();
+}
+
+void updateStrobeEffect(int speed, int count) {
+  static bool isOn = false;
+  static int currentCount = 0;
+  static unsigned long lastToggle = 0;
+  
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastToggle >= speed) {
+    if (currentCount < count * 2) {
+      if (isOn) {
+        for (int j = 0; j < NUM_PIXELS; j++) {
+          lantern.setPixelColor(j, lantern.Color(255, 255, 255));
+        }
+      } else {
+        lantern.clear();
+      }
+      lantern.show();
+      
+      isOn = !isOn;
+      currentCount++;
+      lastToggle = currentTime;
+    } else {
+      currentCount = 0; // Reset for next cycle
+    }
+  }
+}
+
+void updateColorShiftEffect() {
+  static int hue = 0;
+
+  for (int i = 0; i < NUM_PIXELS; i++) {
+    lantern.setPixelColor(i, lantern.ColorHSV(hue, 255, 150));
+  }
+
+  hue += 200;
+  if (hue >= 65535) hue = 0;
+
+  lantern.show();
+}
+
+void updateCandleDripEffect(int red, int green, int blue) {
+  static int currentPixel = 0;
+  static bool isLighting = true;
+  static unsigned long lastUpdate = 0;
+  
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastUpdate >= 100) { // 100ms per pixel
+    if (isLighting && currentPixel < NUM_PIXELS) {
+      lantern.setPixelColor(currentPixel, lantern.Color(red, green, blue));
+      lantern.show();
+      currentPixel++;
+    } else if (isLighting && currentPixel >= NUM_PIXELS) {
+      // Switch to pause phase
+      isLighting = false;
+      lastUpdate = currentTime;
+      return;
+    } else if (!isLighting && (currentTime - lastUpdate) >= 500) {
+      // Reset for next cycle
+      currentPixel = 0;
+      isLighting = true;
+      lantern.clear();
+    }
+    lastUpdate = currentTime;
+  }
+}
+
+void updateBloodDripEffect() {
+  static int currentPixel = 0;
+  static unsigned long lastUpdate = 0;
+  
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastUpdate >= 50) {
+    if (currentPixel < NUM_PIXELS) {
+      lantern.setPixelColor(currentPixel, lantern.Color(150, 0, 0));
+      lantern.show();
+      currentPixel++;
+    } else if ((currentTime - lastUpdate) >= 500) {
+      currentPixel = 0;
+      lantern.clear();
+    }
+    lastUpdate = currentTime;
+  }
+}
+
+void updateElectricalSurgeEffect() {
+  static int flickerCount = 0;
+  static bool isOn = false;
+  static unsigned long lastFlicker = 0;
+  
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastFlicker >= 50) {
+    if (flickerCount < 10) {
+      if (isOn) {
+        for (int j = 0; j < NUM_PIXELS; j++) {
+          lantern.setPixelColor(j, lantern.Color(255, 255, 255));
+        }
+      } else {
+        lantern.clear();
+      }
+      lantern.show();
+      
+      isOn = !isOn;
+      flickerCount++;
+    } else {
+      flickerCount = 0;
+      lastFlicker = currentTime + 1000; // Pause between surges
+    }
+    lastFlicker = currentTime;
+  }
+}
+
+void updateGhostlyPulseEffect() {
+  static float brightness = 10;
+  static float direction = 5;
+
+  brightness += direction;
+  if (brightness >= 150 || brightness <= 10) direction *= -1;
+
+  for (int i = 0; i < NUM_PIXELS; i++) {
+    lantern.setPixelColor(i, lantern.Color((brightness * 150) / 255, 0, (brightness * 255) / 255));
+  }
+  lantern.show();
+}
+
+void updateInfernoEffect() {
+  for (int i = 0; i < NUM_PIXELS; i++) {
+    lantern.setPixelColor(i, lantern.Color(random(200, 255), random(50, 100), 0));
+  }
+  lantern.show();
+}
+
+void updateMistEffect() {
+  for (int i = 0; i < NUM_PIXELS; i++) {
+    lantern.setPixelColor(i, lantern.Color(random(150, 255), random(200, 255), random(200, 255)));
+  }
+  lantern.show();
+}
+
+void updatePumpkinFlickerEffect() {
+  static unsigned long lastUpdate = 0;
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastUpdate >= random(25, 100)) {
+    for (int i = 0; i < NUM_PIXELS; i++) {
+      lantern.setPixelColor(i, lantern.Color(random(200, 255), random(80, 100), 0));
+    }
+    lantern.show();
+    lastUpdate = currentTime;
+  }
+}
+
+void updatePoliceStrobeEffect() {
+  static bool redPhase = true;
+  
+  if (redPhase) {
+    for (int i = 0; i < NUM_PIXELS; i++) {
+      lantern.setPixelColor(i, lantern.Color(255, 0, 0));
+    }
+  } else {
+    for (int i = 0; i < NUM_PIXELS; i++) {
+      lantern.setPixelColor(i, lantern.Color(0, 0, 255));
+    }
+  }
+  lantern.show();
+  redPhase = !redPhase;
+}
+
+void updateEyesWatchingEffect() {
+  static bool eyesOn = false;
+  static unsigned long lastBlink = 0;
+  
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastBlink >= (eyesOn ? random(100, 500) : random(200, 800))) {
+    lantern.clear();
+    if (eyesOn) {
+      lantern.setPixelColor(0, lantern.Color(255, 0, 0));
+      lantern.setPixelColor(6, lantern.Color(255, 0, 0));
+    }
+    lantern.show();
+    eyesOn = !eyesOn;
+    lastBlink = currentTime;
+  }
+}
+
+void updateSmolderingEmbersEffect() {
+  for (int i = 0; i < NUM_PIXELS; i++) {
+    int ember = random(100, 200);
+    lantern.setPixelColor(i, lantern.Color(ember, ember / 4, 0));
+  }
+  lantern.show();
+}
+
+void updateExplosionBurstEffect() {
+  static bool exploded = false;
+  static unsigned long explosionTime = 0;
+  
+  unsigned long currentTime = millis();
+  
+  if (!exploded) {
+    for (int i = 0; i < NUM_PIXELS; i++) {
+      lantern.setPixelColor(i, lantern.Color(255, 255, 255));
+    }
+    lantern.show();
+    exploded = true;
+    explosionTime = currentTime;
+  } else if ((currentTime - explosionTime) > 200) {
+    lantern.clear();
+    lantern.show();
+    if ((currentTime - explosionTime) > 1000) {
+      exploded = false;
+    }
+  }
+}
+
+void updateDimensionalRiftEffect() {
+  for (int i = 0; i < NUM_PIXELS; i++) {
+    lantern.setPixelColor(i, lantern.Color(random(0, 80), random(150, 255), random(200, 255)));
+  }
+  lantern.show();
+}
+
+void updateWitchesBrewEffect() {
+  for (int i = 0; i < NUM_PIXELS; i++) {
+    lantern.setPixelColor(i, lantern.Color(random(60, 100), random(0, 150), random(150, 255)));
+  }
+  lantern.show();
+}
+
+void updateViralOutbreakEffect() {
+  static float brightness = 50;
+  static float direction = 5;
+
+  brightness += direction;
+  if (brightness >= 255 || brightness <= 30) direction *= -1;
+
+  for (int i = 0; i < NUM_PIXELS; i++) {
+    lantern.setPixelColor(i, lantern.Color(0, brightness, 0));
+  }
+  lantern.show();
+}
+
+void updateHellfireEffect() {
+  static unsigned long lastUpdate = 0;
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastUpdate >= random(30, 120)) {
+    for (int i = 0; i < NUM_PIXELS; i++) {
+      lantern.setPixelColor(i, lantern.Color(random(150, 255), random(0, 80), 0));
+    }
+    lantern.show();
+    lastUpdate = currentTime;
+  }
+}
+
+void updateDrowningEffect() {
+  static int brightness = 0;
+  static bool increasing = true;
+  
+  if (increasing) {
+    brightness += 10;
+    if (brightness >= 255) {
+      brightness = 255;
+      increasing = false;
+    }
+  } else {
+    brightness -= 10;
+    if (brightness <= 0) {
+      brightness = 0;
+      increasing = true;
+    }
+  }
+  
+  for (int i = 0; i < NUM_PIXELS; i++) {
+    lantern.setPixelColor(i, lantern.Color(0, 0, brightness));
+  }
+  lantern.show();
+}
+
+void updateSkullFlickerEffect() {
+  static bool skullOn = false;
+  static unsigned long lastBlink = 0;
+  
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastBlink >= (skullOn ? random(40, 160) : random(100, 400))) {
+    lantern.clear();
+    if (skullOn) {
+      lantern.setPixelColor(1, lantern.Color(180, 180, 255));
+      lantern.setPixelColor(5, lantern.Color(180, 180, 255));
+    }
+    lantern.show();
+    skullOn = !skullOn;
+    lastBlink = currentTime;
+  }
+}
+
+void updateZombieCreepEffect() {
+  for (int i = 0; i < NUM_PIXELS; i++) {
+    lantern.setPixelColor(i, lantern.Color(random(80, 150), random(100, 200), 0));
+  }
+  lantern.show();
+}
+
+void updateSpiderWebEffect() {
+  static unsigned long lastUpdate = 0;
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastUpdate >= 90) {
+    lantern.clear();
+    for (int i = 0; i < 3; i++) {
+      lantern.setPixelColor(random(NUM_PIXELS), lantern.Color(200, 200, 200));
+    }
+    lantern.show();
+    lastUpdate = currentTime;
+  }
+}
+
+void updateMagneticPulseEffect() {
+  static int pulseStep = 0;
+  static unsigned long lastUpdate = 0;
+  
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastUpdate >= 40) {
+    lantern.clear();
+    
+    if (pulseStep < NUM_PIXELS / 2) {
+      int center = NUM_PIXELS / 2;
+      lantern.setPixelColor(center + pulseStep, lantern.Color(255, 255, 255));
+      lantern.setPixelColor(center - pulseStep, lantern.Color(255, 255, 255));
+      pulseStep++;
+    } else {
+      pulseStep = 0;
+      lastUpdate = currentTime + 200; // Pause between pulses
+    }
+    
+    lantern.show();
+    lastUpdate = currentTime;
+  }
+}
+
+void updateStarburstEffect() {
+  static int burstStep = 0;
+  static unsigned long lastUpdate = 0;
+  
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastUpdate >= 40) {
+    lantern.clear();
+    
+    if (burstStep < NUM_PIXELS / 2) {
+      int center = NUM_PIXELS / 2;
+      lantern.setPixelColor(center + burstStep, lantern.Color(255, 255, 200));
+      lantern.setPixelColor(center - burstStep, lantern.Color(255, 255, 200));
+      burstStep++;
+    } else {
+      burstStep = 0;
+      lastUpdate = currentTime + 300; // Pause between bursts
+    }
+    
+    lantern.show();
+    lastUpdate = currentTime;
+  }
+}
+
+void updateShadowCreepEffect() {
+  static int shadowPixel = 0;
+  static unsigned long lastUpdate = 0;
+  
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastUpdate >= 50) {
+    if (shadowPixel < NUM_PIXELS) {
+      lantern.setPixelColor(shadowPixel, lantern.Color(0, 0, 0));
+      lantern.show();
+      shadowPixel++;
+    } else if ((currentTime - lastUpdate) >= 500) {
+      shadowPixel = 0;
+      lantern.clear();
+    }
+    lastUpdate = currentTime;
+  }
+}
+
+void updateIceStormEffect() {
+  static unsigned long lastUpdate = 0;
+  
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastUpdate >= random(100, 400)) {
+    lantern.clear();
+    
+    int numFlakes = random(1, NUM_PIXELS);
+    for (int i = 0; i < numFlakes; i++) {
+      lantern.setPixelColor(random(NUM_PIXELS), lantern.Color(0, 150, 255));
+    }
+    lantern.show();
+    lastUpdate = currentTime;
+  }
+}
+
+void updateGraveyardGlowEffect() {
+  for (int i = 0; i < NUM_PIXELS; i++) {
+    int flicker = random(80, 150);
+    lantern.setPixelColor(i, lantern.Color(0, flicker, 0));
+  }
+  lantern.show();
+}
+
+void updateLanternGlowEffect() {
+  static float brightness = 100;
+  static float direction = 5;
+
+  brightness += direction;
+  if (brightness >= 200 || brightness <= 50) direction *= -1;
+
+  for (int i = 0; i < NUM_PIXELS; i++) {
+    lantern.setPixelColor(i, lantern.Color(
+      (brightness * 255) / 200,
+      (brightness * 150) / 200,
+      0
+    ));
+  }
+  lantern.show();
+}
+
+void updateTotalDarknessEffect() {
+  lantern.clear();
+  lantern.show();
+}
+
+// ===============================================================================
+// EFFECT WRAPPER FUNCTIONS
+// ===============================================================================
+
+void effectFlicker() { effectUpdateInterval = 100; updateFlickerEffect(); }
+void effectGlow() { effectUpdateInterval = 20; updateGlowEffect(255, 140, 0); }
+void effectCandleDrip() { effectUpdateInterval = 100; updateCandleDripEffect(255, 140, 0); }
+void effectBlackout() { effectUpdateInterval = 500; updateBlackoutEffect(); }
+void effectBloodDrip() { effectUpdateInterval = 50; updateBloodDripEffect(); }
+void effectElectricalSurge() { effectUpdateInterval = 50; updateElectricalSurgeEffect(); }
+void effectGhostlyPulse() { effectUpdateInterval = 50; updateGhostlyPulseEffect(); }
+void effectInferno() { effectUpdateInterval = 50; updateInfernoEffect(); }
+void effectMist() { effectUpdateInterval = 50; updateMistEffect(); }
+void effectPumpkinFlicker() { effectUpdateInterval = 50; updatePumpkinFlickerEffect(); }
+void effectPoliceStrobe() { effectUpdateInterval = 100; updatePoliceStrobeEffect(); }
+void effectEyesWatching() { effectUpdateInterval = 80; updateEyesWatchingEffect(); }
+void effectSmolderingEmbers() { effectUpdateInterval = 50; updateSmolderingEmbersEffect(); }
+void effectDimensionalRift() { effectUpdateInterval = 70; updateDimensionalRiftEffect(); }
+void effectWitchesBrew() { effectUpdateInterval = 70; updateWitchesBrewEffect(); }
+void effectViralOutbreak() { effectUpdateInterval = 50; updateViralOutbreakEffect(); }
+void effectHellfire() { effectUpdateInterval = 60; updateHellfireEffect(); }
+void effectDrowning() { effectUpdateInterval = 20; updateDrowningEffect(); }
+void effectSkullFlicker() { effectUpdateInterval = 80; updateSkullFlickerEffect(); }
+void effectLanternGlow() { effectUpdateInterval = 50; updateLanternGlowEffect(); }
+void effectTotalDarkness() { effectUpdateInterval = 500; updateTotalDarknessEffect(); }
+void effectZombieCreep() { effectUpdateInterval = 70; updateZombieCreepEffect(); }
+void effectSpiderWeb() { effectUpdateInterval = 90; updateSpiderWebEffect(); }
+void effectMagneticPulse() { effectUpdateInterval = 40; updateMagneticPulseEffect(); }
+void effectStarburst() { effectUpdateInterval = 40; updateStarburstEffect(); }
+void effectShadowCreep() { effectUpdateInterval = 50; updateShadowCreepEffect(); }
+void effectIceStorm() { effectUpdateInterval = 60; updateIceStormEffect(); }
+void effectGraveyardGlow() { effectUpdateInterval = 60; updateGraveyardGlowEffect(); }
+void effectExplosionBurst() { effectUpdateInterval = 20; updateExplosionBurstEffect(); }
+void effectColorShift() { effectUpdateInterval = 30; updateColorShiftEffect(); }
+void effectStrobe() { effectUpdateInterval = 100; updateStrobeEffect(100, 5); }
+
+// Complete effects array
+EffectFunction effects[] = {
+  effectFlicker,
+  effectGlow,
+  effectCandleDrip,
+  effectBlackout,
+  effectBloodDrip,
+  effectElectricalSurge,
+  effectGhostlyPulse,
+  effectInferno,
+  effectMist,
+  effectPumpkinFlicker,
+  effectPoliceStrobe,
+  effectEyesWatching,
+  effectSmolderingEmbers,
+  effectDimensionalRift,
+  effectWitchesBrew,
+  effectViralOutbreak,
+  effectHellfire,
+  effectDrowning,
+  effectSkullFlicker,
+  effectLanternGlow,
+  effectTotalDarkness,
+  effectZombieCreep,
+  effectSpiderWeb,
+  effectMagneticPulse,
+  effectStarburst,
+  effectShadowCreep,
+  effectIceStorm,
+  effectGraveyardGlow,
+  effectExplosionBurst,
+  effectColorShift,
+  effectStrobe
+};
+
+const int numEffects = sizeof(effects) / sizeof(effects[0]);
+
+// ===============================================================================
+// SETUP AND MAIN LOOP
+// ===============================================================================
+
+void setup() {
+  Serial.begin(115200);
+  lantern.begin();
+  lantern.clear();
+  lantern.show();
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  showPowerOnIndicator();
+
+  Serial.println("=== Step 1: Fixed Button Logic ===");
+  Serial.printf("Total effects: %d\n", numEffects);
+  Serial.printf("Button pin %d configured with INPUT_PULLUP\n", BUTTON_PIN);
+  Serial.printf("Button reading: %s\n", digitalRead(BUTTON_PIN) == LOW ? "PRESSED" : "RELEASED");
+  Serial.println("Press button 3 times to arm, then once to light");
+  Serial.println("Watch for button debug messages...");
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+  
+  // Debug output every 10 seconds to show status
+  static unsigned long lastDebug = 0;
+  if (currentTime - lastDebug > 10000) {
+    Serial.printf("📊 STATUS: Button:%s | Armed:%s | Lit:%s | WiFi:%s | Effect:%d\n",
+                 digitalRead(BUTTON_PIN) == LOW ? "PRESSED" : "RELEASED",
+                 armed ? "YES" : "NO",
+                 lampLit ? "YES" : "NO", 
+                 wifiConnected ? "CONNECTED" : "DISCONNECTED",
+                 currentEffectIndex);
+    lastDebug = currentTime;
+  }
+  
+  // Handle button with fixed debounce
+  handleButton(currentTime);
+  
+  // Check WiFi connection status (non-blocking)
+  if (lampLit) {
+    checkWiFiStatus();
+  }
+  
+  // Handle arming timeout
+  if (!armed && pressCount > 0 && (currentTime - lastPressTime > pressTimeout)) {
+    Serial.println("⏰ Arming timeout - resetting to power on state");
+    pressCount = 0;
+    showPowerOnIndicator();
+  }
+
+  // Show appropriate indicators and run effects
+  if (!lampLit) {
+    // Show power indicator when not lit
+    showPowerOnIndicator();
+  } else {
+    // Run current effect when lit
+    runCurrentEffect(currentTime);
+  }
+}
+
+void handleButton(unsigned long currentTime) {
+  // Only check button every debounce period to avoid noise
+  if (currentTime - lastButtonCheck < debounceDelay) {
+    return;
+  }
+  lastButtonCheck = currentTime;
+  
+  int reading = digitalRead(BUTTON_PIN);
+  
+  // Button just pressed
+  if (reading == LOW && lastButtonState == HIGH) {
+    buttonPressed = true;
+    buttonPressTime = currentTime;
+    Serial.println("🔘 BUTTON PRESSED!");
+  }
+  
+  // Button just released
+  else if (reading == HIGH && lastButtonState == LOW) {
+    if (buttonPressed) {
+      unsigned long pressDuration = currentTime - buttonPressTime;
+      Serial.printf("🔘 BUTTON RELEASED (held %lu ms)\n", pressDuration);
+      
+      if (pressDuration >= longPressDuration) {
+        Serial.println("⚡ LONG PRESS - Toggling breaker!");
+        breakerActive = !breakerActive;
+        
+        if (breakerActive) {
+          currentEffectIndex = -1;
+          Serial.println("🚨 Breaker ACTIVATED");
+        } else {
+          armed = false;
+          lampLit = false;
+          pressCount = 0;
+          currentEffectIndex = -1;
+          showPowerOnIndicator();
+          Serial.println("✅ Breaker DEACTIVATED - System reset");
+        }
+      } else {
+        // Short press
+        if (!breakerActive) {
+          Serial.println("⚡ SHORT PRESS - Processing action");
+          handleButtonShortPress();
+        } else {
+          Serial.println("❌ Breaker active - ignoring short press");
+        }
+      }
+      
+      buttonPressed = false;
+    }
+  }
+  
+  lastButtonState = reading;
+
+  // Handle breaker state visual
+  if (breakerActive) {
+    lantern.clear();
+    lantern.show();
+  }
+}
+
+void handleButtonShortPress() {
+  if (!armed) {
+    // ARMING SEQUENCE - Need 3 presses
+    pressCount++;
+    lastPressTime = millis();
+    Serial.printf("=== ARMING PRESS %d/3 ===\n", pressCount);
+    blinkPowerIndicator();
+
+    if (pressCount >= 3) {
+      armed = true;
+      Serial.println("🔥 DEVICE ARMED! Press once to ignite and connect.");
+      showPowerOnIndicator();
+    }
+  } 
+  else if (!lampLit) {
+    // IGNITION - Light lamp + attempt WiFi + start flicker
+    Serial.println("🔥 IGNITING LAMP!");
+    lampLit = true;
+    
+    // Start match strike effect
+    matchStrikeEffect();
+    
+    // Start flickering effect immediately
+    currentEffectIndex = 0; // Flicker effect
+    Serial.println("🎨 Starting FLICKER effect");
+    
+    // Attempt WiFi connection in background
+    attemptWiFiConnection();
+    
+  } 
+  else if (lampLit && !wifiConnected) {
+    // EFFECT CYCLING - Only when WiFi not connected
+    currentEffectIndex++;
+    if (currentEffectIndex >= numEffects) {
+      currentEffectIndex = 0; // Loop back to beginning
+      Serial.println("🔄 Looped back to beginning of effects");
+    }
+    
+    Serial.printf("🎨 CYCLING TO EFFECT %d (%s)\n", currentEffectIndex, getEffectName(currentEffectIndex));
+  }
+  else if (lampLit && wifiConnected) {
+    // WiFi connected - ignore button presses
+    Serial.println("📶 WiFi connected - use remote control for effects");
+  }
+}
+
+void attemptWiFiConnection() {
+  if (!enableWiFi) {
+    Serial.println("📵 WiFi disabled - operating in standalone mode");
+    Serial.println("🎮 Use button to cycle through effects");
+    return;
+  }
+  
+  Serial.println("📶 Attempting WiFi connection...");
+  Serial.printf("📡 Connecting to: %s\n", ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+}
+
+void checkWiFiStatus() {
+  static unsigned long wifiStartTime = 0;
+  static bool wifiAttempting = false;
+  
+  // Skip WiFi if disabled
+  if (!enableWiFi) return;
+  
+  // Start WiFi attempt timing when lamp is first lit
+  if (!wifiAttempting && !wifiConnected && lampLit) {
+    wifiStartTime = millis();
+    wifiAttempting = true;
+    Serial.println("⏱️  WiFi connection attempt started...");
+    return;
+  }
+  
+  if (wifiAttempting && !wifiConnected) {
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiConnected = true;
+      wifiAttempting = false;
+      Serial.println("");
+      Serial.println("✅ WiFi CONNECTION SUCCESSFUL!");
+      Serial.printf("📍 IP address: %s\n", WiFi.localIP().toString().c_str());
+      Serial.println("📶 Network control now available");
+      
+      // Start UDP listener for remote commands
+      if (udp.listen(1234)) {
+        Serial.println("🎧 UDP listener active on port 1234");
+        Serial.println("🎮 Button now disabled - use network commands");
+      }
+      
+    } else if ((millis() - wifiStartTime) > 10000) { // 10 second timeout
+      wifiAttempting = false;
+      Serial.println("");
+      Serial.println("❌ WiFi CONNECTION FAILED");
+      Serial.printf("📡 Could not connect to: %s\n", ssid);
+      Serial.println("🎮 STANDALONE MODE - Use button to cycle effects");
+      Serial.printf("🔄 %d effects available (loops back to start)\n", numEffects);
+    }
+  }
+}
+
+const char* getEffectName(int index) {
+  const char* effectNames[] = {
+    "Flicker", "Glow", "Candle Drip", "Blackout", "Blood Drip",
+    "Electrical Surge", "Ghostly Pulse", "Inferno", "Mist", "Pumpkin Flicker",
+    "Police Strobe", "Eyes Watching", "Smoldering Embers", "Dimensional Rift", "Witches Brew",
+    "Viral Outbreak", "Hellfire", "Drowning", "Skull Flicker", "Lantern Glow",
+    "Total Darkness", "Zombie Creep", "Spider Web", "Magnetic Pulse", "Starburst",
+    "Shadow Creep", "Ice Storm", "Graveyard Glow", "Explosion Burst", "Color Shift", "Strobe"
+  };
+  
+  if (index >= 0 && index < numEffects) {
+    return effectNames[index];
+  }
+  return "Unknown";
+}
+
+void runCurrentEffect(unsigned long currentTime) {
+  if (currentEffectIndex >= 0 && currentEffectIndex < numEffects) {
+    if (currentTime - lastEffectUpdate >= effectUpdateInterval) {
+      effects[currentEffectIndex]();
+      lastEffectUpdate = currentTime;
+    }
+  }
+}
+
+void showPowerOnIndicator() {
+  lantern.clear();
+  uint8_t dim = armed ? 50 : 20;
+  lantern.setPixelColor(0, lantern.Color(dim, dim / 2, 0));
+  lantern.show();
+}
+
+void blinkPowerIndicator() {
+  // Quick blink for feedback
+  lantern.setPixelColor(0, lantern.Color(100, 50, 0));
+  lantern.show();
+  delay(100);  // Short delay just for visual feedback
+  showPowerOnIndicator();
+}
+
+void matchStrikeEffect() {
+  // Quick match strike sequence
+  for (int i = 0; i < NUM_PIXELS; i++) {
+    lantern.setPixelColor(i, lantern.Color(255, 140, 0));
+  }
+  lantern.show();
+  delay(150);
+
+  for (int brightness = 255; brightness >= 0; brightness -= 15) {
+    for (int i = 0; i < NUM_PIXELS; i++) {
+      lantern.setPixelColor(i, lantern.Color(
+        (255 * brightness) / 255,
+        (140 * brightness) / 255,
+        0
+      ));
+    }
+    lantern.show();
+    delay(30);
+  }
+  
+  Serial.printf("Match strike complete. Starting effect %d\n", currentEffectIndex);
+}
